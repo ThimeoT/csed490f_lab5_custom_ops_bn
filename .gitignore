@@ -1,0 +1,26 @@
+# Build directories
+build/
+dist/
+*.egg-info/
+
+# Compiled files
+*.so
+*.o
+*.a
+*.dylib
+*.dll
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Documentation
+README.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
