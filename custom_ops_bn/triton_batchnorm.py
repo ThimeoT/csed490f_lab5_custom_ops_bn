@@ -2,13 +2,10 @@
 Triton kernels for batch normalization.
 
 This module provides pure Triton kernel implementations for batch normalization.
-The kernels use Welford's online algorithm for numerically stable mean and
-variance computation.
+The training kernel computes the mean and centered variance in separate passes.
 
 For PyTorch integration, use the custom operators registered in ops.py.
 
-Note: For production use, the CUDA implementation is recommended for better
-performance and stability.
 """
 
 import triton
@@ -40,27 +37,35 @@ def batchnorm_forward_training_kernel(
 
     c_off = c.to(tl.int64) * stride_c
 
-    # Initialize Welford's algorithm variables
-    mean = tl.zeros([1], dtype=tl.float32)
-    m2 = tl.zeros([1], dtype=tl.float32)
-    count = 0
-
     offs = tl.arange(0, BLOCK_SIZE)
+    count = (N * spatial_dim) * 1.0
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
 
-    # Pass 1: Compute mean and variance using Welford's algorithm
+    # Pass 1: Compute the channel mean.
     for n in range(0, N):
         base = n.to(tl.int64) * stride_n + c_off
         for start in range(0, spatial_dim, BLOCK_SIZE):
             s = start + offs
             mask = s < spatial_dim
             idx = base + s * stride_s
-            x = tl.load(input_ptr + idx, mask=mask, other=0.0)
-            count += tl.sum(mask.to(tl.int32), axis=0)
-            delta = x - mean
-            mean += tl.sum(delta * mask.to(tl.float32), axis=0) / count
-            delta2 = x - mean
-            m2 += tl.sum(delta * delta2 * mask.to(tl.float32), axis=0)
+            x = tl.load(input_ptr + idx, mask=mask, other=0.0).to(tl.float32)
+            acc += x
 
+    mean = tl.sum(acc, axis=0) / count
+
+    # Pass 2: Sum centered squared deviations to avoid cancellation.
+    acc_m2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for n in range(0, N):
+        base = n.to(tl.int64) * stride_n + c_off
+        for start in range(0, spatial_dim, BLOCK_SIZE):
+            s = start + offs
+            mask = s < spatial_dim
+            idx = base + s * stride_s
+            x = tl.load(input_ptr + idx, mask=mask, other=0.0).to(tl.float32)
+            diff = tl.where(mask, x - mean, 0.0)
+            acc_m2 += diff * diff
+
+    m2 = tl.sum(acc_m2, axis=0)
     var = m2 / count
     invstd = 1.0 / tl.sqrt(var + eps)
 
@@ -72,9 +77,11 @@ def batchnorm_forward_training_kernel(
     running_mean = tl.load(running_mean_ptr + c)
     running_var = tl.load(running_var_ptr + c)
 
-    running_mean_new = momentum * running_mean + (1 - momentum) * mean
-    running_var_new = momentum * running_var + (1 - momentum) * var
-    
+    running_mean_new = (1 - momentum) * running_mean + momentum * mean
+    # PyTorch uses unbiased variance for running stats, biased variance above.
+    unbiased_var = m2 / tl.maximum(count - 1, 1.0)
+    running_var_new = (1 - momentum) * running_var + momentum * unbiased_var
+
     tl.store(running_mean_ptr + c, running_mean_new)
     tl.store(running_var_ptr + c, running_var_new)
 
@@ -87,6 +94,11 @@ def batchnorm_forward_training_kernel(
         for start in range(0, spatial_dim, BLOCK_SIZE):
             s = start + offs
             mask = s < spatial_dim
+            idx = base + s * stride_s
+            x = tl.load(input_ptr + idx, mask=mask, other=0.0)
+            x_hat = (x - mean) * invstd
+            y = gamma * x_hat + beta
+            tl.store(output_ptr + idx, y, mask=mask)
 
 
 @triton.jit
